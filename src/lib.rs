@@ -1,0 +1,8 @@
+// src/lib.rs — Library crate exposing all modules for integration tests and
+// re-use in future binaries.
+
+pub mod config;
+pub mod http;
+pub mod message;
+pub mod smtp;
+pub mod spool;

@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────────
+# MyMTA configuration file
+# ─────────────────────────────────────────────────────────────────────
+#
+# All fields are optional.  Missing values fall back to compiled-in
+# defaults.  Environment variables (MTA_*) override values from this
+# file — see README.md for the full list.
+#
+# Usage:
+#   mymta --config mymta.toml
+#   mymta -c /etc/mymta/mymta.toml
+
+[server]
+# IP:port the SMTP server binds to.
+listen   = "0.0.0.0:2525"
+
+# Hostname announced in the 220 greeting and EHLO response.
+hostname = "localhost"
+
+[limits]
+# Maximum message size in bytes (advertised via ESMTP SIZE extension).
+# Default: 10485760 (10 MB)
+max_message_size = 10485760
+
+# Maximum number of RCPT TO recipients per message.
+max_recipients = 100
+
+[spool]
+# Directory where accepted messages are spooled to disk.
+# Relative paths are resolved from the working directory.
+dir = "spool1"
+
+[logging]
+# Log level filter.  Accepts: error, warn, info, debug, trace
+# Also supports per-module filters, e.g. "mymta=debug,info"
+level = "info"
+
+[http]
+# IP:port the HTTP injection API binds to.
+# Default: 0.0.0.0:8025
+listen = "0.0.0.0:8025"
