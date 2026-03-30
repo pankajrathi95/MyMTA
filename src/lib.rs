@@ -4,5 +4,6 @@
 pub mod config;
 pub mod http;
 pub mod message;
+pub mod queue;
 pub mod smtp;
 pub mod spool;

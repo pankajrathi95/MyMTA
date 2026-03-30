@@ -33,6 +33,17 @@ pub struct Config {
     pub log_level: String,
     /// Address for the HTTP injection API (e.g. 0.0.0.0:8025).
     pub http_listen_addr: SocketAddr,
+    // ── Phase 2: Queue settings ────────────────────────────────────
+    /// Default max concurrent deliveries per destination domain.
+    pub queue_concurrency: u32,
+    /// Initial retry delay in seconds.
+    pub queue_retry_initial_delay_secs: u64,
+    /// Backoff multiplier after each failed attempt.
+    pub queue_retry_backoff_multiplier: f64,
+    /// Maximum retry delay cap in seconds.
+    pub queue_retry_max_delay_secs: u64,
+    /// Maximum delivery attempts before giving up.
+    pub queue_retry_max_attempts: u32,
 }
 
 impl Default for Config {
@@ -45,6 +56,12 @@ impl Default for Config {
             spool_dir: PathBuf::from("spool"),
             log_level: "info".into(),
             http_listen_addr: "0.0.0.0:8025".parse().unwrap(),
+            // Queue defaults
+            queue_concurrency: 5,
+            queue_retry_initial_delay_secs: 60,
+            queue_retry_backoff_multiplier: 2.0,
+            queue_retry_max_delay_secs: 3600,
+            queue_retry_max_attempts: 10,
         }
     }
 }
@@ -113,6 +130,32 @@ impl Config {
                 cfg.http_listen_addr = a;
             }
         }
+        // Queue settings
+        if let Ok(v) = std::env::var("MTA_QUEUE_CONCURRENCY") {
+            if let Ok(n) = v.parse() {
+                cfg.queue_concurrency = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MTA_QUEUE_RETRY_INITIAL_DELAY") {
+            if let Ok(n) = v.parse() {
+                cfg.queue_retry_initial_delay_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MTA_QUEUE_RETRY_BACKOFF") {
+            if let Ok(f) = v.parse() {
+                cfg.queue_retry_backoff_multiplier = f;
+            }
+        }
+        if let Ok(v) = std::env::var("MTA_QUEUE_RETRY_MAX_DELAY") {
+            if let Ok(n) = v.parse() {
+                cfg.queue_retry_max_delay_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MTA_QUEUE_RETRY_MAX_ATTEMPTS") {
+            if let Ok(n) = v.parse() {
+                cfg.queue_retry_max_attempts = n;
+            }
+        }
     }
 }
 
@@ -149,6 +192,13 @@ impl std::error::Error for ConfigError {}
 //
 //   [logging]
 //   level = "info"
+//
+//   [queue]
+//   concurrency = 10
+//   retry_initial_delay = 60
+//   retry_backoff = 2.0
+//   retry_max_delay = 3600
+//   retry_max_attempts = 10
 
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
@@ -157,6 +207,7 @@ struct FileConfig {
     spool: Option<SpoolSection>,
     logging: Option<LoggingSection>,
     http: Option<HttpSection>,
+    queue: Option<QueueSection>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -184,6 +235,15 @@ struct LoggingSection {
 #[derive(Debug, Deserialize, Default)]
 struct HttpSection {
     listen: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct QueueSection {
+    concurrency: Option<u32>,
+    retry_initial_delay: Option<u64>,
+    retry_backoff: Option<f64>,
+    retry_max_delay: Option<u64>,
+    retry_max_attempts: Option<u32>,
 }
 
 impl FileConfig {
@@ -223,6 +283,23 @@ impl FileConfig {
                 })?;
             }
         }
+        if let Some(q) = self.queue {
+            if let Some(n) = q.concurrency {
+                cfg.queue_concurrency = n;
+            }
+            if let Some(n) = q.retry_initial_delay {
+                cfg.queue_retry_initial_delay_secs = n;
+            }
+            if let Some(f) = q.retry_backoff {
+                cfg.queue_retry_backoff_multiplier = f;
+            }
+            if let Some(n) = q.retry_max_delay {
+                cfg.queue_retry_max_delay_secs = n;
+            }
+            if let Some(n) = q.retry_max_attempts {
+                cfg.queue_retry_max_attempts = n;
+            }
+        }
         Ok(())
     }
 }
@@ -244,6 +321,12 @@ mod tests {
         assert_eq!(cfg.spool_dir, PathBuf::from("spool"));
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.http_listen_addr, "0.0.0.0:8025".parse::<SocketAddr>().unwrap());
+        // Queue defaults
+        assert_eq!(cfg.queue_concurrency, 5);
+        assert_eq!(cfg.queue_retry_initial_delay_secs, 60);
+        assert_eq!(cfg.queue_retry_backoff_multiplier, 2.0);
+        assert_eq!(cfg.queue_retry_max_delay_secs, 3600);
+        assert_eq!(cfg.queue_retry_max_attempts, 10);
     }
 
     #[test]

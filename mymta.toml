@@ -39,3 +39,13 @@ level = "info"
 # IP:port the HTTP injection API binds to.
 # Default: 0.0.0.0:8025
 listen = "0.0.0.0:8025"
+
+[queue]
+# Default max concurrent deliveries per destination domain.
+concurrency = 5
+
+# Retry schedule settings
+retry_initial_delay = 60      # seconds before first retry
+retry_backoff = 2.0           # multiplier after each failure
+retry_max_delay = 3600        # cap in seconds (1 hour)
+retry_max_attempts = 10       # give up after this many attempts

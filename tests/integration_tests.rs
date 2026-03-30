@@ -209,27 +209,22 @@ async fn full_smtp_conversation() {
     let resp = cmd(&mut reader, &mut writer, "QUIT").await;
     assert!(resp.starts_with("221"), "QUIT failed: {}", resp);
 
-    // Verify message was spooled
+    // Verify message was spooled (single .msg file per message)
     let spool_dir = tmp.path().join("spool");
     let mut entries = tokio::fs::read_dir(&spool_dir).await.unwrap();
-    let mut eml_count = 0;
-    let mut env_count = 0;
+    let mut msg_count = 0;
     while let Some(entry) = entries.next_entry().await.unwrap() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".eml") {
-            eml_count += 1;
+        if name.ends_with(".msg") {
+            msg_count += 1;
             // Verify the spooled message contains our content
             let data = tokio::fs::read(entry.path()).await.unwrap();
             let text = String::from_utf8_lossy(&data);
             assert!(text.contains("Integration Test"), "message content missing");
             assert!(text.contains("Received:"), "Received header missing");
         }
-        if name.ends_with(".env.json") {
-            env_count += 1;
-        }
     }
-    assert_eq!(eml_count, 1, "expected 1 .eml file");
-    assert_eq!(env_count, 1, "expected 1 .env.json file");
+    assert_eq!(msg_count, 1, "expected 1 .msg file");
 }
 
 #[tokio::test]
@@ -363,16 +358,16 @@ async fn multiple_transactions_same_connection() {
 
     cmd(&mut reader, &mut writer, "QUIT").await;
 
-    // Should have 2 messages spooled
+    // Should have 2 messages spooled (single .msg file each)
     let spool_dir = tmp.path().join("spool");
     let mut entries = tokio::fs::read_dir(&spool_dir).await.unwrap();
-    let mut eml_count = 0;
+    let mut msg_count = 0;
     while let Some(entry) = entries.next_entry().await.unwrap() {
-        if entry.file_name().to_string_lossy().ends_with(".eml") {
-            eml_count += 1;
+        if entry.file_name().to_string_lossy().ends_with(".msg") {
+            msg_count += 1;
         }
     }
-    assert_eq!(eml_count, 2, "expected 2 spooled messages");
+    assert_eq!(msg_count, 2, "expected 2 spooled messages");
 }
 
 #[tokio::test]

@@ -56,6 +56,9 @@ pub struct InjectRequest {
     /// Optional extra headers (e.g. Reply-To, X-Mailer).
     #[serde(default)]
     pub headers: Option<HashMap<String, String>>,
+    /// Delivery priority: 0 = High, 1 = Normal (default), 2 = Low.
+    #[serde(default)]
+    pub priority: Option<u8>,
 }
 
 /// Raw injection request — caller provides the complete RFC 5322 message.
@@ -157,11 +160,13 @@ async fn inject(
     raw_msg.push_str("\r\n");
 
     // 4. Validate, enrich, spool — shared pipeline
+    let priority = req.priority.unwrap_or(1); // default Normal
     let queue_id = process_and_spool(
         &state,
         raw_msg.as_bytes(),
         req.from,
         req.to,
+        priority,
     )
     .await?;
 
@@ -186,11 +191,13 @@ async fn inject_raw(
     validate_recipients(&req.recipients, state.config.max_recipients)?;
 
     // 3. Validate, enrich, spool — shared pipeline
+    // InjectRawRequest doesn't specify priority; default to Normal (1)
     let queue_id = process_and_spool(
         &state,
         req.raw_message.as_bytes(),
         req.sender,
         req.recipients,
+        1,
     )
     .await?;
 
@@ -224,11 +231,13 @@ fn validate_recipients(
 }
 
 /// Parse, validate, enrich, and spool a message.  Returns the queue-id.
+/// `priority`: 0=High, 1=Normal (default), 2=Low. Defaults to 1 if None.
 async fn process_and_spool(
     state: &ApiState,
     raw_bytes: &[u8],
     sender: String,
     recipients: Vec<String>,
+    priority: u8,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     // Size check
     if raw_bytes.len() > state.config.max_message_size {
@@ -267,6 +276,7 @@ async fn process_and_spool(
     for rcpt in recipients {
         envelope.add_recipient(rcpt);
     }
+    envelope.priority = priority;
 
     parsed.prepend_received(&envelope.received_header(&state.config.hostname));
     let final_data = parsed.to_bytes();

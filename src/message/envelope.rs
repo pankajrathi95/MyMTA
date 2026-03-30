@@ -7,6 +7,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+/// Default priority: Normal (1)
+fn default_priority() -> u8 { 1 }
+
 /// The SMTP envelope — distinct from the message headers/body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -24,6 +27,9 @@ pub struct Envelope {
     pub received_at: DateTime<Utc>,
     /// ESMTP parameters from MAIL FROM (e.g. SIZE=..., BODY=...).
     pub mail_parameters: Vec<String>,
+    /// Delivery priority: 0 = High, 1 = Normal (default), 2 = Low.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
 }
 
 impl Envelope {
@@ -36,6 +42,7 @@ impl Envelope {
             peer_addr: None,
             received_at: Utc::now(),
             mail_parameters: Vec::new(),
+            priority: 1, // Normal
         }
     }
 

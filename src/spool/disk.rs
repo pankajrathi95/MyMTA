@@ -1,8 +1,12 @@
 // src/spool/disk.rs
 //
-// Disk-based message spool.  Each accepted message is stored as two files:
-//   {queue_id}.env.json  — Envelope metadata (sender, recipients, timestamps)
-//   {queue_id}.eml       — Raw email message (headers + body)
+// Disk-based message spool.  Each message is stored as a single file:
+//   {queue_id}.msg  — Combined envelope + raw message
+//
+// File format (text):
+//   Line 1..N:   Envelope as compact JSON
+//   Separator:   "\n---MESSAGE---\n"
+//   Rest:        Raw RFC 5322 message bytes
 //
 // Writes are atomic: data goes to a temp file first, then renamed into place.
 
@@ -12,6 +16,9 @@ use tokio::io::AsyncWriteExt;
 use tracing;
 
 use crate::message::envelope::Envelope;
+
+/// Separator between envelope JSON and raw message body.
+const SEP: &str = "\n---MESSAGE---\n";
 
 /// Disk-based message spool.
 pub struct DiskSpool {
@@ -29,7 +36,7 @@ impl DiskSpool {
         Ok(Self { spool_dir })
     }
 
-    /// Spool a message to disk.  Returns the path to the .eml file on success.
+    /// Spool a message to disk.  Returns the path to the .msg file on success.
     pub async fn store(
         &self,
         envelope: &Envelope,
@@ -37,18 +44,18 @@ impl DiskSpool {
     ) -> std::io::Result<PathBuf> {
         let queue_id = &envelope.id;
 
-        // ── write envelope JSON (atomic) ────────────────────────────
-        let env_json = serde_json::to_string_pretty(envelope)
+        // Build combined file: envelope JSON + separator + raw message
+        let env_json = serde_json::to_string(envelope)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        let env_tmp = self.spool_dir.join("tmp").join(format!("{}.env.json", queue_id));
-        let env_final = self.spool_dir.join(format!("{}.env.json", queue_id));
-        Self::atomic_write(&env_tmp, &env_final, env_json.as_bytes()).await?;
+        let mut combined = Vec::with_capacity(env_json.len() + SEP.len() + message_data.len());
+        combined.extend_from_slice(env_json.as_bytes());
+        combined.extend_from_slice(SEP.as_bytes());
+        combined.extend_from_slice(message_data);
 
-        // ── write raw message (atomic) ──────────────────────────────
-        let eml_tmp = self.spool_dir.join("tmp").join(format!("{}.eml", queue_id));
-        let eml_final = self.spool_dir.join(format!("{}.eml", queue_id));
-        Self::atomic_write(&eml_tmp, &eml_final, message_data).await?;
+        let tmp_path = self.spool_dir.join("tmp").join(format!("{}.msg", queue_id));
+        let final_path = self.spool_dir.join(format!("{}.msg", queue_id));
+        Self::atomic_write(&tmp_path, &final_path, &combined).await?;
 
         tracing::info!(
             queue_id = %queue_id,
@@ -58,7 +65,7 @@ impl DiskSpool {
             "message spooled to disk"
         );
 
-        Ok(eml_final)
+        Ok(final_path)
     }
 
     /// Write `data` to `tmp_path`, then atomically rename to `final_path`.
@@ -70,21 +77,20 @@ impl DiskSpool {
         let mut f = fs::File::create(tmp_path).await?;
         f.write_all(data).await?;
         f.flush().await?;
-        // sync to ensure data is on disk before rename
         f.sync_all().await?;
         fs::rename(tmp_path, final_path).await?;
         Ok(())
     }
 
-    /// List all queued message IDs (based on .eml files present).
+    /// List all queued message IDs (based on .msg files present).
     pub async fn list_queue(&self) -> std::io::Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut entries = fs::read_dir(&self.spool_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(".eml") {
-                ids.push(name.trim_end_matches(".eml").to_string());
+            if name.ends_with(".msg") {
+                ids.push(name.trim_end_matches(".msg").to_string());
             }
         }
         Ok(ids)
@@ -92,25 +98,45 @@ impl DiskSpool {
 
     /// Read a spooled envelope by queue id.
     pub async fn read_envelope(&self, queue_id: &str) -> std::io::Result<Envelope> {
-        let path = self.spool_dir.join(format!("{}.env.json", queue_id));
-        let data = fs::read_to_string(&path).await?;
-        serde_json::from_str(&data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let (env, _msg) = self.read_parts(queue_id).await?;
+        Ok(env)
     }
 
     /// Read the raw message by queue id.
     pub async fn read_message(&self, queue_id: &str) -> std::io::Result<Vec<u8>> {
-        let path = self.spool_dir.join(format!("{}.eml", queue_id));
-        fs::read(&path).await
+        let (_env, msg) = self.read_parts(queue_id).await?;
+        Ok(msg)
+    }
+
+    /// Read both envelope and message in one pass.
+    pub async fn read_parts(&self, queue_id: &str) -> std::io::Result<(Envelope, Vec<u8>)> {
+        let path = self.spool_dir.join(format!("{}.msg", queue_id));
+        let data = fs::read(&path).await?;
+        Self::parse_msg_file(&data)
+    }
+
+    /// Parse a .msg file into (envelope, message_bytes).
+    fn parse_msg_file(data: &[u8]) -> std::io::Result<(Envelope, Vec<u8>)> {
+        // Find separator
+        let sep_bytes = SEP.as_bytes();
+        let idx = data
+            .windows(sep_bytes.len())
+            .position(|w| w == sep_bytes)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing ---MESSAGE--- separator"))?;
+
+        let env_bytes = &data[..idx];
+        let msg_bytes = &data[idx + sep_bytes.len()..];
+
+        let env: Envelope = serde_json::from_slice(env_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok((env, msg_bytes.to_vec()))
     }
 
     /// Remove a message from the spool (after delivery).
     pub async fn remove(&self, queue_id: &str) -> std::io::Result<()> {
-        let env_path = self.spool_dir.join(format!("{}.env.json", queue_id));
-        let eml_path = self.spool_dir.join(format!("{}.eml", queue_id));
-        // Best-effort removal of both files
-        let _ = fs::remove_file(&env_path).await;
-        let _ = fs::remove_file(&eml_path).await;
+        let path = self.spool_dir.join(format!("{}.msg", queue_id));
+        let _ = fs::remove_file(&path).await;
         Ok(())
     }
 
