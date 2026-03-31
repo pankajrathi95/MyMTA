@@ -12,8 +12,8 @@ resolution, outbound delivery, authentication, and deliverability.
 |---|-------|--------|
 | 1 | SMTP Ingestion | ✅ **Complete** |
 | 1b | HTTP Injection API | ✅ **Complete** |
-| 2 | Queueing | ⬜ Planned |
-| 3 | DNS Resolution | ⬜ Planned |
+| 2 | Queueing | ✅ **Complete** |
+| 3 | DNS Resolution | ✅ **Complete** |
 | 4 | Outbound SMTP Delivery | ⬜ Planned |
 | 5 | Authentication (SPF, DKIM, DMARC) | ⬜ Planned |
 | 6 | Deliverability Features | ⬜ Planned |
@@ -377,18 +377,194 @@ cat spool/*.eml
 
 ---
 
+## Phase 2 — Queueing  ✅
+
+### Overview
+
+The queue manager orchestrates outbound delivery scheduling. Messages are
+organized into per-destination queues, with retry scheduling and concurrency
+limits to ensure reliable, controlled delivery.
+
+### Features Implemented
+
+1. **Per-Destination Queues**
+   - One queue per destination domain (extracted from recipient addresses)
+   - Messages are grouped by domain for efficient MX targeting
+   - Priority ordering within each queue (0=High, 1=Normal, 2=Low)
+
+2. **Retry Scheduling with Exponential Backoff**
+   - Configurable initial delay (default: 60s)
+   - Multiplier applied after each failed attempt (default: 2.0×)
+   - Maximum delay cap (default: 1 hour)
+   - Maximum attempts before giving up (default: 10)
+
+3. **Concurrency Limits**
+   - Default concurrency of 5 deliveries per destination
+   - Prevents overwhelming remote servers
+   - Slots released on success or failure
+
+4. **QueueManager API**
+   - `enqueue()` — add a newly spooled message
+   - `next_for_delivery()` — pick the next ready message respecting concurrency
+   - `on_delivery_success()` — remove from spool and release slot
+   - `on_delivery_failure()` — schedule retry or discard
+
+### Architecture
+
+```
+src/queue/
+├── mod.rs           # Re-exports QueueManager, RetrySchedule
+├── manager.rs       # QueueManager + DestinationQueue + QueuedMessage
+└── retry.rs         # RetrySchedule with backoff math
+```
+
+### Configuration
+
+Queue settings live under `[queue]` in `mymta.toml` and can be overridden
+via environment variables:
+
+| Config Key | Env Variable | Default | Description |
+|------------|--------------|---------|-------------|
+| `concurrency` | `MTA_QUEUE_CONCURRENCY` | 5 | Max concurrent deliveries per domain |
+| `retry_initial_delay` | `MTA_QUEUE_RETRY_INITIAL_DELAY` | 60 | Seconds before first retry |
+| `retry_backoff` | `MTA_QUEUE_RETRY_BACKOFF` | 2.0 | Multiplier per failed attempt |
+| `retry_max_delay` | `MTA_QUEUE_RETRY_MAX_DELAY` | 3600 | Cap on retry delay (seconds) |
+| `retry_max_attempts` | `MTA_QUEUE_RETRY_MAX_ATTEMPTS` | 10 | Attempts before giving up |
+
+Example `mymta.toml` snippet:
+
+```toml
+[queue]
+concurrency = 10
+retry_initial_delay = 30
+retry_backoff = 1.5
+retry_max_delay = 1800
+retry_max_attempts = 8
+```
+
+### Manual Testing
+
+```bash
+# Build and run
+cargo run
+
+# Inject a message via HTTP or SMTP (see Phase 1 / 1b sections)
+# The message is automatically enqueued for delivery
+
+# Inspect the queue state (currently via logs / spool files)
+ls spool/
+cat spool/*.env.json
+```
+
+Future CLI tools (`mymta queue list`, `mymta queue stats`) are planned.
+
+### Test Coverage
+
+| Test | Description |
+|------|-------------|
+| `enqueue_and_pickup` | Spool → enqueue → deliver → success removes from spool |
+| `concurrency_limit` | Only N messages delivered in parallel per domain |
+| `priority_ordering` | High priority messages are picked before low priority |
+
+---
+
+## Phase 3 — DNS Resolution  ✅
+
+### Overview
+
+DNS resolution is essential for outbound delivery. The resolver finds MX hosts
+for destination domains, falls back to A/AAAA when no MX exists, and caches
+results to reduce latency and load.
+
+All tests use `MockDnsResolver` — **zero network calls**.
+
+### Features Implemented
+
+1. **MX Record Lookup**
+   - Query MX records for a domain
+   - Parse preference + exchange host
+   - Return sorted by preference (lower = higher priority)
+
+2. **A/AAAA Fallback**
+   - If no MX records, fall back to A (and AAAA) as implicit MX per RFC 5321 §5.1
+   - Used by delivery layer when MX lookup returns empty/NODATA
+
+3. **TTL-Aware Caching**
+   - Positive cache: MX, A, AAAA records stored with their DNS TTL
+   - Negative cache: NXDOMAIN / NODATA cached with a shorter TTL (default 5 min)
+   - Max TTL cap (default 1 hour) prevents stale entries
+
+4. **CNAME Handling**
+   - Mock resolver supports explicit CNAME programming for tests
+   - Real resolver relies on hickory's internal CNAME handling
+
+5. **Error Classification (Delivery Impact)**
+
+   | Error | Meaning | Delivery Action |
+   |-------|---------|-----------------|
+   | `NXDOMAIN` | Domain doesn't exist | **Permanent** → Bounce |
+   | `NODATA` | No MX/A/AAAA records | **Permanent** → Bounce |
+   | `SERVFAIL` | Server failure | **Temporary** → Retry |
+   | `REFUSED` | Query refused | **Temporary** → Retry |
+   | `Timeout` | No response | **Temporary** → Retry |
+   | `CNAME loop` | Chain too deep | **Permanent** → Bounce |
+
+### Architecture
+
+```
+src/dns/
+├── mod.rs        # Re-exports
+├── error.rs      # DnsError + DnsFailureMode (permanent vs temporary)
+├── cache.rs      # DnsCache with TTL + negative caching
+└── resolver.rs   # DnsResolver trait + MockDnsResolver + RealResolver
+```
+
+### Usage (Trait-Based)
+
+```rust
+use mymta::dns::{DnsResolver, MockDnsResolver, MxResult};
+
+// In production, use RealResolver (hickory-resolver backed)
+// In tests, inject MockDnsResolver — no network ever
+
+let resolver: &dyn DnsResolver = &mock;
+match resolver.resolve_mx("example.com").await {
+    MxResult::Ok(records) => { /* pick MX by preference */ }
+    MxResult::Err(e) if e.is_permanent() => { /* bounce */ }
+    MxResult::Err(e) if e.is_temporary() => { /* retry later */ }
+    _ => {}
+}
+```
+
+### Configuration
+
+| Setting | Env Variable | Default | Description |
+|---------|--------------|---------|-------------|
+| `dns_timeout_secs` | `MTA_DNS_TIMEOUT` | 5 | Per-query timeout |
+| `dns_cache_max_ttl_secs` | `MTA_DNS_CACHE_MAX_TTL` | 3600 | Cap on positive TTL |
+| `dns_cache_neg_ttl_secs` | `MTA_DNS_CACHE_NEG_TTL` | 300 | Negative cache TTL |
+| `dns_max_cname_depth` | `MTA_DNS_MAX_CNAME_DEPTH` | 8 | Max CNAME chain |
+
+### Test Coverage
+
+All 21 DNS tests use `MockDnsResolver` — **zero network calls**:
+
+| Test | Description |
+|------|-------------|
+| `mock_mx_ok` | Program MX success, verify records returned |
+| `mock_mx_nxdomain` | Unprogrammed domain → NXDOMAIN (permanent) |
+| `mock_mx_servfail` | Program SERVFAIL → temporary |
+| `mock_timeout_is_temporary` | Timeout classified as retryable |
+| `mock_a_ok` / `mock_aaaa_ok` | IPv4/IPv6 resolution |
+| `mock_case_insensitive` | Domain lookups are case-insensitive |
+| `mx_cache_hit_and_miss` | Cache stores and retrieves |
+| `mx_cache_expires` | TTL expiry works |
+| `negative_cache` | NXDOMAIN/NODATA cached |
+| `ttl_cap` | DNS TTLs capped by max_ttl |
+
+---
+
 ## Upcoming Phases
-
-### Phase 2 — Queueing
-- Persistent queue with retry scheduling
-- Configurable retry intervals and max attempts
-- Queue inspection / management CLI
-
-### Phase 3 — DNS Resolution
-- MX record lookup
-- A/AAAA fallback
-- DNS caching
-- Priority-based MX selection
 
 ### Phase 4 — Outbound SMTP Delivery
 - Connect to remote MX servers

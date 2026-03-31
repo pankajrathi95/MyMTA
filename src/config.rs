@@ -44,6 +44,15 @@ pub struct Config {
     pub queue_retry_max_delay_secs: u64,
     /// Maximum delivery attempts before giving up.
     pub queue_retry_max_attempts: u32,
+    // ── Phase 3: DNS settings ──────────────────────────────────────
+    /// Per-query DNS timeout in seconds.
+    pub dns_timeout_secs: u64,
+    /// Max TTL for cached positive DNS entries (caps DNS TTLs).
+    pub dns_cache_max_ttl_secs: u64,
+    /// TTL for negative cache entries (NXDOMAIN/NODATA).
+    pub dns_cache_neg_ttl_secs: u64,
+    /// Max CNAME chain depth before error.
+    pub dns_max_cname_depth: usize,
 }
 
 impl Default for Config {
@@ -62,6 +71,11 @@ impl Default for Config {
             queue_retry_backoff_multiplier: 2.0,
             queue_retry_max_delay_secs: 3600,
             queue_retry_max_attempts: 10,
+            // DNS defaults
+            dns_timeout_secs: 5,
+            dns_cache_max_ttl_secs: 3600,
+            dns_cache_neg_ttl_secs: 300,
+            dns_max_cname_depth: 8,
         }
     }
 }
@@ -156,6 +170,27 @@ impl Config {
                 cfg.queue_retry_max_attempts = n;
             }
         }
+        // DNS settings
+        if let Ok(v) = std::env::var("MTA_DNS_TIMEOUT") {
+            if let Ok(n) = v.parse() {
+                cfg.dns_timeout_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MTA_DNS_CACHE_MAX_TTL") {
+            if let Ok(n) = v.parse() {
+                cfg.dns_cache_max_ttl_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MTA_DNS_CACHE_NEG_TTL") {
+            if let Ok(n) = v.parse() {
+                cfg.dns_cache_neg_ttl_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MTA_DNS_MAX_CNAME_DEPTH") {
+            if let Ok(n) = v.parse() {
+                cfg.dns_max_cname_depth = n;
+            }
+        }
     }
 }
 
@@ -208,6 +243,7 @@ struct FileConfig {
     logging: Option<LoggingSection>,
     http: Option<HttpSection>,
     queue: Option<QueueSection>,
+    dns: Option<DnsSection>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -244,6 +280,14 @@ struct QueueSection {
     retry_backoff: Option<f64>,
     retry_max_delay: Option<u64>,
     retry_max_attempts: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DnsSection {
+    timeout_secs: Option<u64>,
+    cache_max_ttl_secs: Option<u64>,
+    cache_neg_ttl_secs: Option<u64>,
+    max_cname_depth: Option<usize>,
 }
 
 impl FileConfig {
@@ -300,6 +344,20 @@ impl FileConfig {
                 cfg.queue_retry_max_attempts = n;
             }
         }
+        if let Some(d) = self.dns {
+            if let Some(n) = d.timeout_secs {
+                cfg.dns_timeout_secs = n;
+            }
+            if let Some(n) = d.cache_max_ttl_secs {
+                cfg.dns_cache_max_ttl_secs = n;
+            }
+            if let Some(n) = d.cache_neg_ttl_secs {
+                cfg.dns_cache_neg_ttl_secs = n;
+            }
+            if let Some(n) = d.max_cname_depth {
+                cfg.dns_max_cname_depth = n;
+            }
+        }
         Ok(())
     }
 }
@@ -327,6 +385,11 @@ mod tests {
         assert_eq!(cfg.queue_retry_backoff_multiplier, 2.0);
         assert_eq!(cfg.queue_retry_max_delay_secs, 3600);
         assert_eq!(cfg.queue_retry_max_attempts, 10);
+        // DNS defaults
+        assert_eq!(cfg.dns_timeout_secs, 5);
+        assert_eq!(cfg.dns_cache_max_ttl_secs, 3600);
+        assert_eq!(cfg.dns_cache_neg_ttl_secs, 300);
+        assert_eq!(cfg.dns_max_cname_depth, 8);
     }
 
     #[test]
