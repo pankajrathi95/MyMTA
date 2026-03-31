@@ -14,8 +14,8 @@ resolution, outbound delivery, authentication, and deliverability.
 | 1b | HTTP Injection API | ✅ **Complete** |
 | 2 | Queueing | ✅ **Complete** |
 | 3 | DNS Resolution | ✅ **Complete** |
-| 4 | Outbound SMTP Delivery | ⬜ Planned |
-| 5 | Authentication (SPF, DKIM, DMARC) | ⬜ Planned |
+| 4 | Outbound SMTP Delivery | ✅ **Complete** |
+| 5 | Authentication (SPF, DKIM, DMARC) | ✅ **Complete** |
 | 6 | Deliverability Features | ⬜ Planned |
 
 ---
@@ -64,6 +64,11 @@ src/
 ├── main.rs              # Entry point — runs SMTP + HTTP concurrently
 ├── lib.rs               # Library crate root
 ├── config.rs            # Runtime configuration (TOML + env + defaults)
+├── auth/
+│   ├── mod.rs           # Public exports (DkimSigner, SpfVerifier, DmarcVerifier)
+│   ├── dkim.rs          # DKIM signing with RSA-SHA256
+│   ├── spf.rs           # SPF record parsing and verification
+│   └── dmarc.rs         # DMARC record parsing and alignment checking
 ├── smtp/
 │   ├── mod.rs
 │   ├── command.rs       # SMTP command parser + email address validation
@@ -77,9 +82,25 @@ src/
 │   ├── mod.rs
 │   ├── envelope.rs      # SMTP envelope (MAIL FROM / RCPT TO metadata)
 │   └── parser.rs        # RFC 5322 header parser + validator
-└── spool/
-    ├── mod.rs
-    └── disk.rs           # Disk-based message spool with atomic writes
+├── spool/
+│   ├── mod.rs
+│   └── disk.rs          # Disk-based message spool with atomic writes
+├── queue/
+│   ├── mod.rs
+│   ├── manager.rs       # QueueManager with per-destination queues
+│   └── retry.rs         # Retry schedule with exponential backoff
+├── dns/
+│   ├── mod.rs
+│   ├── error.rs         # DNS error types
+│   ├── cache.rs         # TTL-aware DNS cache
+│   └── resolver.rs      # DnsResolver trait + MockDnsResolver + RealResolver
+└── delivery/
+    ├── mod.rs           # Public exports
+    ├── error.rs         # DeliveryError with classification
+    ├── result.rs        # DeliveryResult, RecipientResult
+    ├── mx_resolve.rs    # MX resolution with A/AAAA fallback
+    ├── connector.rs     # TCP connection + TLS support
+    └── client.rs        # SMTP client implementation
 ```
 
 ### Configuration
@@ -234,9 +255,15 @@ cargo test --test integration_tests
 | `message::envelope` | 4 | Create, set, reset, Received header generation |
 | `message::parser` | 8 | Parsing, folding, required headers, line lengths, Message-ID, roundtrip |
 | `spool::disk` | 4 | Store+read, list, remove, directory creation |
+| `queue::manager` | 3 | Enqueue/pickup, concurrency limits, priority ordering |
+| `queue::retry` | 3 | Retry schedule, backoff math, max delay cap |
+| `dns::resolver` | 21 | MX, A, AAAA resolution, caching, CNAME handling |
 | **SMTP Integration** | **7** | Full conversation, pipelining, bad sequences, RSET, multi-transaction, NOOP/HELP, unknown commands |
 | **HTTP Integration** | **14** | Health, structured inject, raw inject, sender validation, recipient validation, empty/too-many recipients, empty sender, missing headers, multi-recipient, custom headers, null sender, 404, bad JSON |
-| **Total** | **96** | |
+| **Delivery** | **23** | MX resolution, SMTP client, error classification, per-recipient results, MX fallback |
+| **Auth** | **21** | DKIM signing, SPF verification, DMARC verification |
+| **Config** | **8** | TOML parsing, env vars, DKIM selector loading |
+| **Total** | **141** | |
 
 ---
 
@@ -564,18 +591,396 @@ All 21 DNS tests use `MockDnsResolver` — **zero network calls**:
 
 ---
 
+## Phase 4 — Outbound SMTP Delivery  ✅
+
+### Overview
+
+The delivery module implements a full RFC 5321 compliant SMTP client for outbound
+message delivery. It connects to resolved MX hosts, handles the SMTP conversation,
+and classifies delivery results for proper retry or bounce handling.
+
+### Features Implemented
+
+1. **MX to IP Resolution**
+   - Query MX records and sort by preference (lower = higher priority)
+   - Resolve MX exchange hostnames to IPv6 (AAAA) and IPv4 (A) addresses
+   - A/AAAA fallback when no MX records exist (per RFC 5321 §5.1)
+   - Multiple MX fallback — try next MX on connection failure
+
+2. **SMTP Protocol Client**
+   - Full SMTP conversation: EHLO/HELO, MAIL FROM, RCPT TO, DATA, QUIT
+   - Capability detection (SIZE, 8BITMIME, PIPELINING, STARTTLS)
+   - HELO fallback for non-ESMTP servers
+   - Proper dot-stuffing for message body (lines starting with `.` are escaped)
+   - Multi-line response parsing
+
+3. **Connection Management**
+   - Configurable timeouts: connect, command, data transmission
+   - Per-destination connection handling
+   - Graceful connection cleanup
+
+4. **TLS/STARTTLS Support**
+   - Framework for STARTTLS upgrade (port 587)
+   - Implicit TLS support (SMTPS on port 465)
+   - Configurable TLS requirements
+
+5. **Delivery Result Tracking**
+   - Per-recipient status tracking
+   - Success, transient failure, permanent failure classification
+   - TLS usage tracking per delivery
+   - Which MX server was used
+
+6. **Error Classification**
+
+   | SMTP Code | Classification | Action |
+   |-----------|----------------|--------|
+   | 2xx | Success | Delivery complete |
+   | 4xx | Transient | Retry with exponential backoff |
+   | 5xx | Permanent | Generate bounce (DSN) |
+   | Connection failure | Transient | Try next MX |
+   | DNS failure | Transient/Permanent | Depends on error type |
+
+### Architecture
+
+```
+src/delivery/
+├── mod.rs           # Public exports
+├── error.rs         # DeliveryError, SmtpStage, error classification
+├── result.rs        # DeliveryResult, RecipientResult
+├── mx_resolve.rs    # MxResolver, ResolvedDestination
+├── connector.rs     # SmtpConnector, ConnectionConfig, SmtpConnection
+└── client.rs        # SmtpClient with full SMTP protocol implementation
+```
+
+### Usage
+
+```rust
+use mymta::delivery::{MxResolver, SmtpClient, SmtpConnector, ConnectionConfig};
+use mymta::dns::resolver::RealResolver;
+use std::sync::Arc;
+
+// Resolve destination
+let resolver = Arc::new(RealResolver::new()?);
+let mx_resolver = MxResolver::new(resolver);
+let destinations = mx_resolver.resolve("example.com").await?;
+
+// Create SMTP client
+let config = ConnectionConfig::default();
+let connector = SmtpConnector::new(config);
+let client = SmtpClient::new(connector);
+
+// Deliver message
+let result = client.deliver(
+    &destinations,
+    "sender@example.com",
+    &["recipient@example.com".to_string()],
+    b"Subject: Hello\r\n\r\nWorld!\r\n",
+).await?;
+
+// Handle results
+for (recipient, status) in &result.recipients {
+    match status {
+        RecipientResult::Success { message } => {
+            println!("Delivered to {}: {}", recipient, message);
+        }
+        RecipientResult::TransientFailure(e) => {
+            println!("Retry later for {}: {}", recipient, e);
+            // Schedule retry via QueueManager
+        }
+        RecipientResult::PermanentFailure(e) => {
+            println!("Bounce {}: {}", recipient, e);
+            // Generate DSN
+        }
+    }
+}
+```
+
+### Configuration
+
+| Setting | Env Variable | Default | Description |
+|---------|--------------|---------|-------------|
+| `smtp_connect_timeout_secs` | `MTA_SMTP_CONNECT_TIMEOUT` | 30 | TCP connect timeout |
+| `smtp_command_timeout_secs` | `MTA_SMTP_COMMAND_TIMEOUT` | 60 | EHLO/MAIL/RCPT timeout |
+| `smtp_data_timeout_secs` | `MTA_SMTP_DATA_TIMEOUT` | 300 | Message body timeout |
+| `smtp_enable_tls` | `MTA_SMTP_ENABLE_TLS` | true | Enable STARTTLS |
+| `smtp_require_tls` | `MTA_SMTP_REQUIRE_TLS` | false | Require TLS (fail if unavailable) |
+| `smtp_local_hostname` | `MTA_HOSTNAME` | localhost | Hostname for EHLO/HELO |
+
+### Test Coverage
+
+| Test | Description |
+|------|-------------|
+| `test_mx_resolution_success` | MX lookup with preference sorting |
+| `test_mx_with_ipv6_preference` | IPv6 addresses prioritized |
+| `test_a_aaaa_fallback` | Fallback to A record when no MX |
+| `test_mx_unresolvable_exchange_skipped` | Skip MXes that don't resolve |
+| `test_select_destination` | MX selection with attempted tracking |
+| `test_successful_delivery` | Full SMTP conversation |
+| `test_delivery_with_rejected_recipient` | Mixed success/failure per recipient |
+| `test_multiple_mx_fallback` | Try next MX on connection failure |
+| `test_delivery_error_classification` | 4xx/5xx classification |
+| `test_delivery_result_aggregation` | Per-recipient result tracking |
+
+### Running the Example
+
+```bash
+# Run the delivery example (shows MX resolution for real domains)
+cargo run --example delivery_example
+
+# Run delivery-specific tests
+cargo test --lib delivery
+cargo test --test delivery_tests
+```
+
+---
+
+## Phase 5 — Authentication (SPF, DKIM, DMARC) ✅
+
+### Overview
+
+The authentication module provides email authentication mechanisms for both
+outbound signing (DKIM) and inbound verification (SPF, DMARC). These are
+essential for modern email deliverability and security.
+
+### Features Implemented
+
+1. **DKIM Signing (RFC 6376)**
+   - RSA-SHA256 signature generation
+   - Configurable private key storage path
+   - Header and body canonicalization (simple/relaxed)
+   - Automatic DNS record generation for public key publishing
+   - Support for multiple selectors and domains
+
+2. **SPF Verification (RFC 7208)**
+   - SPF record parsing (v=spf1)
+   - Mechanism evaluation: `all`, `ip4`, `ip6`, `a`, `mx`, `include`, `exists`
+   - CIDR range matching for IPv4 and IPv6
+   - Result classification: `none`, `neutral`, `pass`, `fail`, `softfail`, `temperror`, `permerror`
+   - SMTP response recommendations for fail results
+
+3. **DMARC Verification (RFC 7489)**
+   - DMARC record parsing (v=DMARC1)
+   - Alignment checking for DKIM and SPF (strict/relaxed)
+   - Policy enforcement: `none`, `quarantine`, `reject`
+   - Subdomain policy support
+   - Aggregate and forensic report URI parsing
+
+4. **Configuration**
+   - TOML configuration for all auth settings
+   - Environment variable overrides
+   - Per-domain DKIM key selection
+   - Configurable verification strictness
+
+### Architecture
+
+```
+src/auth/
+├── mod.rs           # Public exports (DkimSigner, SpfVerifier, DmarcVerifier)
+├── dkim.rs          # DKIM signing with RSA-SHA256
+├── spf.rs           # SPF record parsing and verification
+└── dmarc.rs         # DMARC record parsing and alignment checking
+```
+
+### Usage
+
+#### DKIM Signing
+
+```rust
+use mymta::auth::{DkimConfig, DkimSigner};
+
+// Create a DKIM config with private key path
+let config = DkimConfig::new(
+    "default",                          // selector
+    "example.com",                      // domain
+    "/etc/mymta/dkim/example.com.pem",  // private key path
+);
+
+// Create signer and sign a message
+let signer = DkimSigner::from_config(config)?;
+
+let headers = vec![
+    ("From".to_string(), "sender@example.com".to_string()),
+    ("To".to_string(), "recipient@example.com".to_string()),
+    ("Subject".to_string(), "Hello".to_string()),
+];
+let body = b"Hello, World!\r\n";
+
+let dkim_signature = signer.sign(&headers, body)?;
+// Add to message: DKIM-Signature: {dkim_signature}
+```
+
+**Using Multiple Selectors from Config:**
+
+```rust
+use mymta::config::Config;
+
+// Load config with multiple selectors
+let cfg = Config::load(Some(Path::new("mymta.toml")))?;
+
+// Look up a specific selector
+if let Some(selector) = cfg.get_dkim_selector("2024") {
+    println!("Domain: {}, Key: {:?}", selector.domain, selector.key_path);
+}
+
+// Find the right selector for a domain
+if let Some((name, selector)) = cfg.find_dkim_selector_for_domain("example.com", Some("default")) {
+    println!("Using selector '{}' for example.com", name);
+}
+
+// Get all selectors for a domain (useful for key rotation)
+let selectors = cfg.get_dkim_selectors_for_domain("example.com");
+for (name, selector) in selectors {
+    println!("Available selector: {}", name);
+}
+```
+
+#### SPF Verification
+
+```rust
+use mymta::auth::{SpfVerifier, SpfResult};
+use std::net::IpAddr;
+
+let verifier = SpfVerifier::new();
+
+// Parse an SPF record
+let record = "v=spf1 ip4:192.168.1.0/24 include:_spf.google.com ~all";
+let policy = verifier.parse_record(record)?;
+
+// Evaluate against an IP address
+let client_ip: IpAddr = "192.168.1.50".parse()?;
+let result = verifier.evaluate(&policy, client_ip, "example.com");
+
+match result {
+    SpfResult::Pass => println!("SPF passed"),
+    SpfResult::Fail => println!("SPF failed - reject message"),
+    SpfResult::SoftFail => println!("SPF soft fail - accept but flag"),
+    _ => {}
+}
+```
+
+#### DMARC Verification
+
+```rust
+use mymta::auth::{DmarcVerifier, DmarcPolicy, DmarcResult};
+
+let verifier = DmarcVerifier::new();
+
+// Parse a DMARC record
+let record = "v=DMARC1; p=reject; rua=mailto:dmarc@example.com; pct=100";
+let dmarc = verifier.parse_record(record)?;
+
+// Check alignment
+let from_domain = "example.com";
+let dkim_domain = "example.com";
+let spf_domain = "example.com";
+
+let dkim_aligned = verifier.check_dkim_alignment(
+    from_domain,
+    dkim_domain,
+    dmarc.dkim_alignment,
+);
+
+let spf_aligned = verifier.check_spf_alignment(
+    from_domain,
+    spf_domain,
+    dmarc.spf_alignment,
+);
+
+// Evaluate DMARC result
+let result = verifier.evaluate(&dmarc, dkim_aligned, spf_aligned);
+
+if result.is_fail() && dmarc.policy == DmarcPolicy::Reject {
+    println!("Reject message per DMARC policy");
+}
+```
+
+### Configuration
+
+#### TOML Configuration
+
+**Simple config (single selector per domain):**
+
+```toml
+[auth]
+dkim_key_dir = "/etc/mymta/dkim"
+dkim_selector = "default"
+spf_verify = true
+dmarc_verify = true
+spf_reject_fail = false
+dmarc_reject_fail = false
+```
+
+**Advanced config (multiple selectors per domain):**
+
+```toml
+[auth]
+spf_verify = true
+dmarc_verify = true
+
+# Multiple DKIM selectors for different domains and key rotation
+[auth.dkim.selectors.default]
+domain = "example.com"
+key_path = "/etc/mymta/dkim/example.com.default.pem"
+algorithm = "rsa-sha256"
+header_canon = "relaxed"
+body_canon = "relaxed"
+
+# Key rotation: new 2024 key alongside old default
+[auth.dkim.selectors."2024"]
+domain = "example.com"
+key_path = "/etc/mymta/dkim/example.com.2024.pem"
+algorithm = "rsa-sha256"
+
+# Different domain with custom signed headers
+[auth.dkim.selectors.mail]
+domain = "example.org"
+key_path = "/etc/mymta/dkim/example.org.mail.pem"
+signed_headers = "from,to,subject,date,message-id"
+```
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MTA_DKIM_KEY_DIR` | none | Directory containing DKIM private keys |
+| `MTA_DKIM_SELECTOR` | none | Default DKIM selector |
+| `MTA_SPF_VERIFY` | `true` | Enable SPF verification |
+| `MTA_DMARC_VERIFY` | `true` | Enable DMARC verification |
+| `MTA_SPF_REJECT_FAIL` | `false` | Reject messages with SPF hard fail |
+| `MTA_DMARC_REJECT_FAIL` | `false` | Reject messages failing DMARC policy |
+
+### Generating DKIM Keys
+
+```bash
+# Generate a 2048-bit RSA private key
+openssl genrsa -out example.com.pem 2048
+
+# Extract the public key for DNS
+openssl rsa -in example.com.pem -pubout -outform DER | base64 -w0
+
+# DNS TXT record (selector: default)
+# Name: default._domainkey.example.com
+# Value: v=DKIM1; k=rsa; p=<base64-public-key>
+```
+
+### Test Coverage
+
+| Test | Description |
+|------|-------------|
+| `test_canonicalize_body_simple` | Simple body canonicalization |
+| `test_canonicalize_body_relaxed` | Relaxed body canonicalization |
+| `test_body_hash` | SHA-256 body hash computation |
+| `test_parse_mechanism_ip4` | SPF ip4 mechanism parsing |
+| `test_parse_record` | SPF record parsing |
+| `test_ip_in_cidr4` | IPv4 CIDR matching |
+| `test_dkim_alignment` | DKIM alignment checking |
+| `test_spf_alignment` | SPF alignment checking |
+| `test_evaluate` | DMARC result evaluation |
+| `test_parse_record` | DMARC record parsing |
+
+---
+
 ## Upcoming Phases
-
-### Phase 4 — Outbound SMTP Delivery
-- Connect to remote MX servers
-- TLS/STARTTLS support
-- Delivery status tracking (delivered, deferred, bounced)
-
-### Phase 5 — Authentication
-- SPF verification
-- DKIM signing
-- DMARC policy enforcement
-- SMTP AUTH (for submission)
 
 ### Phase 6 — Deliverability Features
 - Rate limiting

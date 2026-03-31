@@ -18,5 +18,10 @@ hyper = { version = "1", features = ["full"] }
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 async-trait = "0.1"
 
+# Phase 5: Authentication dependencies
+base64 = "0.22"
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+sha2 = "0.10"
+
 [dev-dependencies]
 tempfile = "3"

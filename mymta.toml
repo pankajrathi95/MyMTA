@@ -49,3 +49,28 @@ retry_initial_delay = 60      # seconds before first retry
 retry_backoff = 2.0           # multiplier after each failure
 retry_max_delay = 3600        # cap in seconds (1 hour)
 retry_max_attempts = 10       # give up after this many attempts
+
+[auth]
+# Simple DKIM configuration (single selector)
+# dkim_key_dir = "/etc/mymta/dkim"
+# dkim_selector = "default"
+
+# SPF and DMARC verification
+spf_verify = true
+dmarc_verify = true
+
+# Uncomment to reject messages that fail authentication
+# spf_reject_fail = true
+# dmarc_reject_fail = true
+
+# Advanced: Multiple DKIM selectors per domain
+# [auth.dkim.selectors.default]
+# domain = "example.com"
+# key_path = "/etc/mymta/dkim/example.com.default.pem"
+# algorithm = "rsa-sha256"
+# header_canon = "relaxed"
+# body_canon = "relaxed"
+#
+# [auth.dkim.selectors."2024"]
+# domain = "example.com"
+# key_path = "/etc/mymta/dkim/example.com.2024.pem"
